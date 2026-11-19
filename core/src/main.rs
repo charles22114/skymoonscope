@@ -180,6 +180,9 @@ struct AppConfig {
     /// L2 treats it as stale. Default 100 ≈ 8 minutes at 5 s/ledger.
     #[serde(default = "default_max_ledger_age")]
     max_ledger_age: u32,
+    /// TTL in seconds for the in-memory contract ledger cache (default 300).
+    #[serde(default = "default_ledger_cache_ttl_secs")]
+    ledger_cache_ttl_secs: u64,
     /// Maximum on-disk simulation cache size in megabytes (default 100).
     #[serde(default = "default_max_cache_size_mb")]
     max_cache_size_mb: u64,
@@ -278,6 +281,10 @@ fn default_max_ledger_age() -> u32 {
     100
 }
 
+fn default_ledger_cache_ttl_secs() -> u64 {
+    300
+}
+
 fn default_max_cache_size_mb() -> u64 {
     100
 }
@@ -352,6 +359,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("emergency_verification_paused", false)?
         .set_default("disk_cache_path", "")?
         .set_default("max_ledger_age", 100)?
+        .set_default("ledger_cache_ttl_secs", default_ledger_cache_ttl_secs())?
         .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
@@ -2231,16 +2239,18 @@ async fn main() {
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
-    let filter = EnvFilter::from_default_env();
+    let filter = build_env_filter(&config.rust_log);
     if log_json {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
+        tracing_subscriber::registry()
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-        .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "Sky Moon Scope Starting...");
     tracing::info!("Sky Moon Scope initialized with config: {:?}", redacted_config(&config));
@@ -2290,11 +2300,14 @@ async fn main() {
 
     // ── CLI: merkle subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "merkle" {
-        if args.len() < 4 {
-            eprintln!("Usage: sky-moon-scope-core merkle <build|proof> <args>");
+        if args.len() < 3 {
+            eprintln!("Usage: sky-moon-scope-core merkle <build|build-file|proof|visualize|visualize-file> <args>");
             eprintln!("Commands:");
-            eprintln!("  build <leaf1> <leaf2> ...            Build a Merkle tree and print the root hash");
+            eprintln!("  build <leaf1> <leaf2> ...              Build a Merkle tree and print the root hash");
+            eprintln!("  build-file <file>                      Build a Merkle tree from a newline-delimited leaf file");
             eprintln!("  proof <leaf_index> <leaf1> <leaf2> ... Generate a Merkle proof for the given leaf index");
+            eprintln!("  visualize <leaf1> <leaf2> ...          Visualize Merkle tree structure as ASCII art");
+            eprintln!("  visualize-file <file>                  Visualize Merkle tree structure from file as ASCII art");
             std::process::exit(1);
         }
 
@@ -2308,6 +2321,34 @@ async fn main() {
                 let leaves: Vec<Vec<u8>> = args[3..]
                     .iter()
                     .map(|arg| arg.as_bytes().to_vec())
+                    .collect();
+                let mut tree = merkle_tree::MerkleTree::new(32);
+                match tree.build(leaves) {
+                    Ok(()) => println!("{}", tree.get_root_hex()),
+                    Err(err) => {
+                        eprintln!("Error building Merkle tree: {}", err);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "build-file" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: sky-moon-scope-core merkle build-file <file>");
+                    eprintln!("  Each non-empty line in <file> is treated as a leaf value.");
+                    std::process::exit(1);
+                }
+                let file_path = &args[3];
+                let content = match std::fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", file_path, e);
+                        std::process::exit(1);
+                    }
+                };
+                let leaves: Vec<Vec<u8>> = content
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.as_bytes().to_vec())
                     .collect();
                 let mut tree = merkle_tree::MerkleTree::new(32);
                 match tree.build(leaves) {
@@ -2356,13 +2397,80 @@ async fn main() {
                 });
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
             }
+            "visualize" | "ascii" | "tree" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: sky-moon-scope-core merkle visualize <leaf1> <leaf2> ...");
+                    std::process::exit(1);
+                }
+                let leaves: Vec<Vec<u8>> = args[3..]
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect();
+                let mut tree = merkle_tree::MerkleTree::new(32);
+                match tree.build(leaves) {
+                    Ok(()) => println!("{}", tree.to_ascii_art()),
+                    Err(err) => {
+                        eprintln!("Error building Merkle tree: {}", err);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "visualize-file" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: sky-moon-scope-core merkle visualize-file <file>");
+                    eprintln!("  Each non-empty line in <file> is treated as a leaf value.");
+                    std::process::exit(1);
+                }
+                let file_path = &args[3];
+                let content = match std::fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", file_path, e);
+                        std::process::exit(1);
+                    }
+                };
+                let leaves: Vec<Vec<u8>> = content
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.as_bytes().to_vec())
+                    .collect();
+                let mut tree = merkle_tree::MerkleTree::new(32);
+                match tree.build(leaves) {
+                    Ok(()) => println!("{}", tree.to_ascii_art()),
+                    Err(err) => {
+                        eprintln!("Error building Merkle tree: {}", err);
+                        std::process::exit(1);
+                    }
+                }
+            }
             unknown => {
                 eprintln!("Unknown merkle command: {}", unknown);
-                eprintln!("Available commands: build, proof");
+                eprintln!("Available commands: build, build-file, proof, visualize, visualize-file");
                 std::process::exit(1);
             }
         }
 
+        return;
+    }
+
+    // ── CLI: visualize-merkle shortcut ──────────────────────────────────
+    if args.len() > 1 && (args[1] == "visualize-merkle" || args[1] == "merkle-ascii") {
+        if args.len() < 3 {
+            eprintln!("Usage: sky-moon-scope-core visualize-merkle <leaf1> <leaf2> ...");
+            std::process::exit(1);
+        }
+        let leaves: Vec<Vec<u8>> = args[2..]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let mut tree = merkle_tree::MerkleTree::new(32);
+        match tree.build(leaves) {
+            Ok(()) => println!("{}", tree.to_ascii_art()),
+            Err(err) => {
+                eprintln!("Error building Merkle tree: {}", err);
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -2850,7 +2958,10 @@ async fn main() {
     let sled_db = sled::open("sky_moon_scope_cache").expect("Failed to open sled database");
     let simulation_cache =
         SimulationCache::new_with_max_cache_size_mb(&sled_db, config.max_cache_size_mb);
-    let contract_cache = Arc::new(ContractCache::new(&sled_db));
+    let contract_cache = Arc::new(ContractCache::new(
+        &sled_db,
+        std::time::Duration::from_secs(config.ledger_cache_ttl_secs),
+    ));
 
     let app_metrics = Arc::new(
         AppMetrics::new().expect("Failed to initialize Prometheus metrics"),
